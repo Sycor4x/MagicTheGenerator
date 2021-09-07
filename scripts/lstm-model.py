@@ -65,17 +65,14 @@ def parse_args():
     parser.add_argument("-r", "--lr", type=float, default=1e-3, help="NN learning rate")
     parser.add_argument("-e", "--n_epoch", type=int, default=1, help="NN epochs")
     parser.add_argument("-b", "--batch_size", type=int, default=32)
+    parser.add_argument("-t", "--temperature", type=float, default=1., help="temperature for random sampling")
     parser.add_argument(
         "-T",
         "--test_run",
         action="store_true",
         help="set this flag to just use a tiny data set",
     )
-    parser.add_argument(
-        "--argmax",
-        action="store_true",
-        help="set this flag to use argmax instead of random sampling for decoding",
-    )
+    parser.add_argument("-d", "--decoder", choices=[ "viterbi", "random"], help="the algorithm to use for decoding the model")
     return parser.parse_args()
 
 
@@ -83,13 +80,12 @@ class Codec(object):
     def __init__(self, max_len=32):
         self.maxlen = max_len
         self.special = ["_PAD", "_GO", "_END", "_UNK"]
-        self.str2num = {s: i for i, s in enumerate(self.special)}
+        self.str2num = {sg: ix for ix, sg in enumerate(self.special)}
         self.exclude = [self.str2num[c] for c in self.special]
-        for (
-            s
-        ) in """ "&'(),-./?ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyzàáâíöúû""":
+        all_chars = """ "&'(),-./?ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyzàáâíöúû"""
+        for s in all_chars:
             self.str2num.update({s: len(self.str2num)})
-        self.num2str = {i: s for s, i in self.str2num.items()}
+        self.num2str = {ix: sg for sg, ix in self.str2num.items()}
 
     def __len__(self):
         return len(self.str2num)
@@ -109,12 +105,14 @@ class Codec(object):
         return [self.decoder(arr) for arr in arr_list]
 
     def decoder(self, arr):
-        return "".join([self.num2str[i] for i in arr if i not in self.exclude])
+        list_str = [self.num2str[ix] for ix in arr if ix not in self.exclude]
+        return "".join(list_str)
 
 
 def process_card_names(card_data, minlen=4):
     out = []
     for n in card_data:
+        # skip double cards; long-term, work out how to incorporate them
         if "//" in n or len(n) < minlen:
             continue
         out.append(n)
@@ -141,24 +139,24 @@ class NameDataset(Dataset):
         return self.name_arr.shape[0]
 
 
-def partition_data(data, test=0.1, validate=0.1):
+def partition_data(data, test=0.1, validate=0.1,stratify=None):
     assert test > 0.0
     assert validate > 0.0
     assert test + validate < 0.5
     (
         data__,
         data_test,
-    ) = train_test_split(data, test_size=test)
+    ) = train_test_split(data, test_size=test, stratify=stratify)
     new_validate = validate / (1.0 - test)
     (
         data_train,
         data_valid,
-    ) = train_test_split(data__, test_size=new_validate)
+    ) = train_test_split(data__, test_size=new_validate, stratify=stratify[data__])
     return data_train, data_valid, data_test
 
 
 class UnitNorm(nn.Module):
-    def __init__(self, ord=2, dim=None):
+    def __init__(self, ord=1, dim=None):
         super(UnitNorm, self).__init__()
         self.ord = ord
         self.dim = dim
@@ -187,20 +185,20 @@ class ResidualNet(nn.Module):
 
 
 class InitializerNet(nn.Module):
-    def __init__(self, n_features, n_units=256, lstm_layers=1, activation=nn.ELU()):
+    def __init__(self, n_features, n_units, lstm_layers=1, activation=nn.ELU()):
         super(InitializerNet, self).__init__()
         self.lstm_layers = lstm_layers
         self.n_units = n_units
-        self.inp = nn.Sequential(nn.Linear(n_features, n_units * lstm_layers))
-        self.resid = ResidualNet(n_units * lstm_layers, activation=activation)
-        self.norm = UnitNorm(dim=2)
+        self.initial_net = [nn.Linear(n_features, n_units ) for _ in range( lstm_layers)]
+        self.resid_net = [ResidualNet(n_units,activation=activation) for _ in range(lstm_layers)]
+        self.norm = UnitNorm(dim=1)
 
     def forward(self, x):
-        x = self.inp(x)
-        x = self.resid(x)
-        x = x.view(self.lstm_layers, x.size(0), self.n_units)
-        x = self.norm(x)
-        return x
+        y = [self.initial_net[ix](x) for ix in range( self.lstm_layers)]
+        z = [resid(inp) for resid, inp in zip(self.resid_net, y)]
+        w = [self.norm(z_) for z_ in z]
+        out = torch.stack(w, dim=0)
+        return out
 
 
 class NameNet(nn.Module):
@@ -249,10 +247,19 @@ class NameNet(nn.Module):
         logits = self.dense_net(lstm_out)
         return logits.transpose(1, 2), hc_state
 
-    def predict_proba(self, name, card_data):
-        logits = self.forward(name=name, card_data=card_data)
+    def predict_proba(self, name, card_data=None, hc_state=None):
+        logits, hc_state = self.forward(
+            name=name, card_data=card_data, hc_state=hc_state
+        )
         probs = self.softmax(logits)
-        return probs
+        return probs, hc_state
+
+    def predict_log_proba(self, name, card_data=None, hc_state=None):
+        logits, hc_state = self.forward(
+            name=name, card_data=card_data, hc_state=hc_state
+        )
+        log_probs = logits.exp() - logits.logsumexp(dim=2, keepdims=True)
+        return log_probs, hc_state
 
 
 class ColorEncoder(object):
@@ -341,7 +348,7 @@ class Gatherer(object):
         return out
 
 
-class Sampler(object):
+class RandomSampler(object):
     def __init__(self, codec, net, limit=35, temperature=1.0):
         assert 2 < limit < 128
         assert isinstance(limit, int)
@@ -351,6 +358,7 @@ class Sampler(object):
         self.limit = limit
         self.t = temperature
 
+    @torch.no_grad()
     def __call__(self, card_info, argmax=False):
         if argmax:
             sampler = self.argmax_sampler
@@ -386,49 +394,99 @@ class Sampler(object):
         return logits.argmax(1).view(-1)
 
 
-class ViterbiSampler(Sampler):
-    def __init__(self, codec, net, limit=35, temperature=1.0):
+class ViterbiSampler(object):
+    def __init__(self, codec, net, limit=35):
         assert 2 < limit < 128
         assert isinstance(limit, int)
-        assert 0.0 < temperature
         self.codec = codec
         self.net = net
         self.limit = limit
-        self.t = temperature
 
+    @staticmethod
+    @torch.no_grad()
+    def predict_viterbi_many(log_emiss, log_prior, log_trans):
+        """
+        Given the Viterbi algorithm and the estimated parameters of the model, compute the most
+        likely sequence of hidden states states.
+        This is designed to be a completely general case, allowing for time-varying
+        transition matrices and per-observational-unit prior vectors.
+        Alternatively, `predict_viterbi_single` is a Viterbi algorithm implementation that
+        assumes the more typical HMM model where transitions and priors are fixed values.
+        TODO - generalize this for the case of partially-observed latent states. It will just
+               involve adding logic for a mask to be applied to the new alphas, as per the
+               buam-welch modification.
+        """
+        # TODO - add coverage for partially-observed latent sequences.
+        # TODO - complete this method
+        # We work on the log-probability scale because all we care about is which state has
+        # highest probability.
+        N, T, K, _ = log_trans.shape
+        assert (*log_emiss.shape,) == (N, T, K)
+        assert (*log_prior.shape,) in ((N, K), (1, K), (K,))
+        assert (*log_trans.shape,) == (N, T, K, K)
+
+        log_alpha = torch.zeros((N, T, K))
+        psi = torch.zeros_like(log_alpha, dtype=torch.long)
+        # Compute the first alpha
+        log_alpha0 = log_prior + log_emiss[:, 0, ...]
+        log_alpha0 -= torch.logsumexp(log_alpha0, dim=1, keepdims=True)
+        log_alpha[:, 0, :] = log_alpha0
+        for t in range(1, T):
+            prev_a = log_alpha[:, t - 1, :]  # (N, K)
+            z = prev_a.unsqueeze(-1).repeat(1, 1, K)
+            z += log_trans[:, t - 1, ...]  # (N, K, K)
+            val, idx = z.max(1)
+            psi[:, t, :] = idx
+            alpha_t = val + log_emiss[:, t, :]
+            alpha_t -= torch.logsumexp(alpha_t, dim=1, keepdims=True)
+            log_alpha[:, t, :] = alpha_t
+
+        _, idx = log_alpha[:, -1, :].max(1)
+        path = torch.zeros((N, T), dtype=torch.long)
+        path[:, -1] = idx
+        buffer = torch.zeros(N, dtype=torch.long)
+        for k in range(T - 2, -1, -1):
+            child = path[:, k + 1]  # (N,)
+            for i, j in enumerate(child):
+                buffer[i] = psi[i, k + 1, j]
+            path[:, k] = buffer
+        return path
+
+    @torch.no_grad()
     def __call__(self, card_info, argmax=False):
-        if argmax:
-            sampler = self.argmax_sampler
-        else:
-            sampler = self.random_sampler
-        n = card_info.size(0)
-        tokens = torch.LongTensor(np.zeros((n, self.limit + 1)))
-        tokens[:, 0] = self.codec.str2num["_GO"]
-        logits, hc_state = self.net(tokens[:, 0].view(-1, 1), card_data=card_info)
+        N = card_info.size(0)
+        T = self.limit + 1
+        K = len(self.codec.str2num)
+
+        log_prior = -100.0 * torch.ones((N, K))
+        log_prior[:, self.codec.str2num["_GO"]] = 0.0
+
+        log_trans = torch.zeros((N, T, K, K))
+        log_trans[:, 0, :, :] = -100.0
+        in_tokens = torch.LongTensor(self.codec.str2num["_GO"] * np.ones((N, 1)))
+        log_prob, (h_state, c_state) = self.net.predict_log_proba(
+            in_tokens, card_data=card_info
+        )
+        log_trans[:, 0, self.codec.str2num["_GO"], :] = log_prob.squeeze(2)
+
         # hc_state: (layers, observations, units)
-        # TODO - we could add "early stopping" logic to terminate if all samples include
-        #  the _END token
-        #       but it's probably not worth the effort because sequences are short
-        for i in range(0, self.limit):
+        h_buff = h_state.repeat(K, 1, 1, 1)
+        c_buff = c_state.repeat(K, 1, 1, 1)
+        for i in range(1, T):
             # while len(tokens) < self.limit and self.codec.decoder(new_token) != "_END":
-            tokens[:, i + 1] = sampler(logits)
-            logits, hc_state = self.net(tokens[:, i + 1].view(-1, 1), hc_state=hc_state)
+            for j, tok in enumerate(range(K)):
+                in_tokens = torch.LongTensor(tok * np.ones((N, 1)))
+                hc_state = (h_buff[j, ...], c_buff[j, ...])
+                log_prob, (h_state, c_state) = self.net(in_tokens, hc_state=hc_state)
+                log_trans[:, i, j, :] = log_prob.squeeze(2)
+                h_buff[j, ...] = h_state
+                c_buff[j, ...] = c_state
+
+        log_emiss = torch.ones((N, T, K)) / K
+        tokens = self.predict_viterbi_many(log_emiss, log_prior, log_trans )
         tokens = tokens.detach().numpy()
-        extent = {k: self.limit for k in range(n)}
-        for row, col in np.argwhere(tokens == self.codec.str2num["_END"]):
-            char_idx = extent.get(row, self.limit)
-            extent.update({row: min(col, char_idx)})
         out = self.codec.decode_many(tokens)
-        out = [out[m][:p] for m, p in extent.items()]
         return out
-
-    def random_sampler(self, logits):
-        logits /= self.t
-        new_tokens = Categorical(logits=logits.squeeze(2)).sample()
-        return new_tokens
-
-    def argmax_sampler(self, logits: torch.Tensor):
-        return logits.argmax(1).view(-1)
 
 
 if __name__ == "__main__":
@@ -464,7 +522,7 @@ if __name__ == "__main__":
     enc_names = np.vstack(codec.encode_many(names)).astype(np.int64)
     # TODO - add feature for legendary supertype
     train_idx, val_idx, test_idx = partition_data(
-        range(len(names)), validate=0.15, test=0.15
+        range(len(names)), validate=0.15, test=0.15, stratify=[int(w > 5) for w in weights]
     )
     print(
         f"Train size: {len(train_idx)}; Valid. size: {len(val_idx)}; Test size: {len(test_idx)}."
@@ -508,11 +566,16 @@ if __name__ == "__main__":
     my_net = NameNet(
         vocab_size=len(codec),
         n_features=features.shape[1],
-        n_units=128,
-        lstm_layers=2,
+        n_units=64,
+        lstm_layers=3,
         dropout=0.25,
     )
-    my_sampler = Sampler(codec=codec, net=my_net, temperature=0.5)
+    if args.decoder == "viterbi":
+        my_sampler = ViterbiSampler(codec=codec, net=my_net)
+    elif args.decoder == "random":
+        my_sampler = RandomSampler(codec=codec, net=my_net)
+    else:
+        raise ValueError(f"Value provided to argument `decoder` not recognized: {args.decoder}")
     param_count = sum(p.numel() for p in my_net.parameters() if p.requires_grad)
     print(f"The model has {param_count} parameters.")
     my_optim = Adam(my_net.parameters(), lr=args.lr)
@@ -536,7 +599,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 val_pred, *_ = my_net(name=val_name, card_data=val_feats)
                 val_loss = my_loss(val_pred, val_target).mean()
-                generated_names = my_sampler(val_feats[:10], argmax=args.argmax)
+                generated_names = my_sampler(val_feats[:10])
         print(
             f"Epoch {i}\tTraining loss {buf.mean() :.6f} \u00b1 {1.96 * buf.std(ddof=1) / np.sqrt( buf.size):.6f}"
         )
